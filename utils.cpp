@@ -78,7 +78,6 @@ TaskHandle_t statusCheckHandle = NULL;
 
 static inline void runStatusCheck();
 static bool startPing();
-static bool waitForNTPsync(int maxRetries = 5, uint32_t perTryTimeoutMs = 2000);
 char timezone[FILE_NAME_LEN] = "GMT0";
 char ntpServer[MAX_HOST_LEN] = "pool.ntp.org";
 
@@ -133,6 +132,8 @@ const char* getEncType(int ssidIndex) {
     case (WIFI_AUTH_WPA2_PSK): return "WPA2_PSK";
     case (WIFI_AUTH_WPA_WPA2_PSK): return "WPA_WPA2_PSK";
     case (WIFI_AUTH_WPA2_ENTERPRISE): return "WPA2_ENTERPRISE";
+   	case (WIFI_AUTH_WPA3_PSK): return "WPA3_PSK";
+	   case (WIFI_AUTH_WPA2_WPA3_PSK): return "WPA2_WPA3_PSK";
     case (WIFI_AUTH_MAX): return "AUTH_MAX";
     default: return "Not listed";
   }
@@ -330,50 +331,174 @@ static bool startEth(bool firstcall) {
   return ETH.linkUp();
 }
 
-static bool startWifi(bool firstcall = true) {
-  // start wifi station (and wifi AP if allowed or station not defined)
+// Event group handles and bits for Wi-Fi connection status
+static EventGroupHandle_t wifiEventGroup = NULL;
+static bool wifiEventHandlerRegistered = false;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+
+// Initializes and manages Wi-Fi (STA/AP), returning true if STA connects successfully.
+static bool startWifi(bool firstcall = true) { // firstcall: true on initial invocation to apply one-time HW config.
+  // Apply one-time Wi-Fi hardware configuration and suppress default behaviors.
   if (firstcall) {
-#ifdef NO_WIFI_SLEEP
-    WiFi.setSleep(false); // Disable Power Saving depending on app
-#endif
-    WiFi.persistent(false); // prevent the flash storage WiFi credentials
+    WiFi.mode(WIFI_AP_STA); // Enable concurrent Station and Access Point modes.
+    WiFi.setSleep(true); // Setup modem sleep to configure association latency(Options: true - for energy efficiency, false - for continuous power supply.
+    WiFi.setTxPower(WIFI_POWER_15dBm); // Set the Wi-Fi transmit power(range vs energy efficiency). Options: WIFI_POWER_19_5dBm, WIFI_POWER_15dBm, WIFI_POWER_8_5dBm, WIFI_POWER_2dBm, etc ...(see the documentation)
+    WiFi.persistent(false); // Disable NVS flash writes for Wi-Fi credentials.
+    WiFi.STA.setAutoReconnect(false); // Disable auto-reconnect to manage connection lifecycle manually.
     WiFi.AP.clear();
-    WiFi.AP.end(); // kill rogue AP on startup
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.STA.setAutoReconnect(false); // Set whether module will attempt to reconnect to an access point in case it is disconnected
-    WiFi.STA.setHostname(hostName);
-    delay(100);
+    WiFi.AP.end(); // Terminate residual AP state from previous runs.
+    WiFi.STA.setHostname(hostName); // Assign custom hostname for DHCP/DNS resolution.
+    vTaskDelay(1); // Yield to allow Wi-Fi driver task to process initialization.
   }
-  
+
+  bool localAllowAP = allowAP;
   wl_status_t wlStat = WL_NO_SSID_AVAIL;
+  // Attempt Station mode connection if network mode permits (netMode == 0).
   if (netMode == 0) {
-    // connect to Wifi station
-    setWifiSTA();
-    uint32_t startAttemptTime = millis();
-    // Stop trying on failure timeout, will try to reconnect later by ping
-    wlStat = WL_NO_SSID_AVAIL;
-    if (strlen(ST_SSID)) {
-      while (wlStat = WiFi.STA.status(), wlStat != WL_CONNECTED && millis() - startAttemptTime < 5000)  {
-        LOG_SEND(".");
-        delay(500);
+    // Register the Wi-Fi event handler once to update the event group.
+    if (!wifiEventHandlerRegistered) {
+      WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+        if (wifiEventGroup == NULL) return;
+        if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+          xEventGroupSetBits(wifiEventGroup, WIFI_CONNECTED_BIT);
+        } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+          xEventGroupSetBits(wifiEventGroup, WIFI_FAIL_BIT);
+        }
+      });
+      wifiEventHandlerRegistered = true;
+    }
+
+    // Create the event group if it does not exist, BEFORE starting the connection.
+    if (wifiEventGroup == NULL) {
+      wifiEventGroup = xEventGroupCreate();
+    }
+    if (wifiEventGroup != NULL) {
+      // Clear bits before starting the connection attempt to prevent race conditions.
+      xEventGroupClearBits(wifiEventGroup, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    }
+
+    setWifiSTA(); // Apply Station configuration (SSID/password).
+    wlStat = WL_NO_SSID_AVAIL; // Reset status; reconnection is deferred to background ping task.
+    
+    // Poll connection status with a 5-second timeout to prevent indefinite blocking.
+    if (strlen(ST_SSID) > 0) {
+      if (wifiEventGroup != NULL) {
+        EventBits_t bits = 0;
+        uint32_t startAttemptTime = millis();
+        // Wait for connection or failure with a 100ms loop to preserve progress logging.
+        while (!(bits & (WIFI_CONNECTED_BIT | WIFI_FAIL_BIT)) && (millis() - startAttemptTime < 5000)) {
+          bits = xEventGroupWaitBits(
+            wifiEventGroup,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE, // Do not clear bits on exit
+            pdFALSE, // Wait for any bit
+            pdMS_TO_TICKS(100)
+          );
+          if (!(bits & (WIFI_CONNECTED_BIT | WIFI_FAIL_BIT))) {
+            LOG_SEND(".");
+          }
+        }
+        
+        if (bits & WIFI_CONNECTED_BIT) {
+          wlStat = WL_CONNECTED;
+        } else {
+          wlStat = WiFi.STA.status(); // Get exact status if failed or timeout
+        }
+      } else {
+        // Fallback to polling if event group creation failed
+        uint32_t startAttemptTime = millis();
+        wlStat = WiFi.STA.status();
+        while (wlStat != WL_CONNECTED && (millis() - startAttemptTime < 5000)) {
+          LOG_SEND(".");
+          vTaskDelay(pdMS_TO_TICKS(100)); // Yield to prevent task watchdog timeout.
+          wlStat = WiFi.STA.status();
+        }
       }
     }
-    // show stats of requested SSID if present
-    int numNetworks = strlen(ST_SSID) ? WiFi.scanNetworks() : 0;
-    for (int i=0; i < numNetworks; i++) {
-      if (WiFi.SSID(i) == ST_SSID)
-        LOG_INF("Wifi stats for %s - signal strength: %ld dBm; Encryption: %s; channel: %ld",  ST_SSID, WiFi.RSSI(i), getEncType(i), WiFi.channel(i));
+
+    if (wlStat == WL_CONNECTED) {
+      // Log successful STA connection metrics.
+      LOG_VRB("Wi-Fi connected to %s - signal strength: %ld dBm; channel: %ld",
+              ST_SSID,
+              (long)WiFi.RSSI(),
+              (long)WiFi.channel());
+    } else {
+      // Log connection failure diagnostics and trigger asynchronous scan for debugging.
+      LOG_WRN("SSID %s not connected %s - status: %d; mode: %d; signal strength: %ld dBm; channel: %ld",
+              ST_SSID,
+              wifiStatusStr(wlStat),
+              (int)wlStat,
+              (int)WiFi.getMode(),
+              (long)WiFi.RSSI(),
+              (long)WiFi.channel());
+
+      // Capture a copy of the target SSID before starting the scan.
+      static char targetSsid[sizeof(ST_SSID)];
+      strlcpy(targetSsid, ST_SSID, sizeof(targetSsid));
+
+      // Register one-time event handler to log target SSID details upon scan completion.
+      static bool scanEventRegistered = false;
+      if (!scanEventRegistered) {
+        WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+          if (event == ARDUINO_EVENT_WIFI_SCAN_DONE) {
+            uint16_t numNetworks = info.wifi_scan_done.number;
+            for (uint16_t i = 0; i < numNetworks; i++) {
+              if (strcmp(WiFi.SSID(i).c_str(), targetSsid) == 0) {
+                LOG_INF("Wi-Fi stats for %s - signal strength: %ld dBm; Encryption: %s; channel: %ld",
+                        targetSsid,
+                        (long)WiFi.RSSI(i),
+                        getEncType(i),
+                        (long)WiFi.channel(i));
+              }
+            }
+            WiFi.scanDelete(); // Release heap allocated for scan results.
+          }
+        }, ARDUINO_EVENT_WIFI_SCAN_DONE);
+        scanEventRegistered = true;
+      }
+
+      // Initiate non-blocking background Wi-Fi scan.
+      if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
+          // Do not start another scan.
+      } else {
+          // Clear the STA connecting state to allow scanning.
+          WiFi.disconnect(false);
+          vTaskDelay(pdMS_TO_TICKS(100)); // Yield to allow Wi-Fi driver to process disconnection.
+
+          int16_t scanResult = WiFi.scanNetworks(true); // true = async background scan.
+          if (scanResult == WIFI_SCAN_FAILED) {
+            LOG_WRN("Wi-Fi scan failed - result: %d", (int)scanResult);
+          }
+      }
     }
-    if (wlStat != WL_CONNECTED) LOG_WRN("SSID %s not connected %s", ST_SSID, wifiStatusStr(wlStat));
+  }
+
+  // Fallback to AP mode if STA connection failed or AP is explicitly allowed.
+  if (localAllowAP ||
+    wlStat == WL_NO_SSID_AVAIL ||
+    wlStat == WL_CONNECT_FAILED ||
+    wlStat == WL_DISCONNECTED ||
+    wlStat == WL_IDLE_STATUS) {
+    setWifiAP(); // Configure and start Access Point for provisioning or fallback access.
   }
   
-  if (wlStat == WL_NO_SSID_AVAIL || allowAP) setWifiAP(); // AP allowed if no Station SSID eg on first time use 
+  // Start mDNS only on the ESP32-S3 and only if the Station obtained a valid IP address.
 #if CONFIG_IDF_TARGET_ESP32S3
-  if (netMode == 0) setupMdnsHost(); // not on ESP32 as uses 6k of heap
+  if (netMode == 0) {
+    if ((uint32_t)WiFi.localIP() != 0) {
+      setupMdnsHost();
+    }
+  }
 #endif
-  if (pingHandle == NULL) startPing();
-  getWifiMode();
-  return wlStat == WL_CONNECTED ? true : false;
+
+  // Ensure background ping task is active for connection monitoring.
+  if (pingHandle == NULL) {
+    startPing();
+  }
+  
+  // Return true only if Station mode achieved a connected state.
+  return wlStat == WL_CONNECTED;
 }
 
 bool startNetwork(bool firstcall) {
@@ -415,8 +540,8 @@ bool startNetwork(bool firstcall) {
     snprintf(startupFailure, SF_LEN, STARTUP_FAIL "Failed to complete network setup");
     LOG_WRN("%s", startupFailure);
   }
-  if (res) getExtIP();
   if (res) while(!dataFilesChecked) delay (1000);
+  if (res) getExtIP();
   return res;
 }
 
@@ -490,7 +615,7 @@ static void pingTimeout(esp_ping_handle_t hdl, void *args) {
       }
     }
   } else {
-    if (strlen(ST_SSID)) {
+    if (ST_SSID[0]) {
       wl_status_t wStat = WiFi.STA.status();
       if (wStat != WL_NO_SSID_AVAIL && wStat != WL_NO_SHIELD) {
         if (usePing) {
@@ -593,7 +718,8 @@ static uint8_t failCounts[REMFAILCNT] = {0};
 
 void remoteServerClose(Client& client) {
   uint32_t startAttempt = millis();
-  while (client.available() > 0 && (millis() - startAttempt < 1000)) client.read();
+  uint8_t dumpBuf[64];
+  while (client.available() > 0 && (millis() - startAttempt < 1000)) client.read(dumpBuf, sizeof(dumpBuf));
   if (client.connected()) client.stop();
 }
 
@@ -643,7 +769,6 @@ bool remoteServerConnect(Client& client, const char* host, uint16_t port, uint8_
 static bool remoteServerConnectSec(NetworkClientSecure& client, const char* host, uint16_t port, uint8_t idx) {
   if (checkFailureThreshold(host, idx)) {
     // Additional operations for secure client
-    waitForNTPsync();
     if (timeSynchronized || !useSecure) {
       if (ESP.getFreeHeap() <= TLS_HEAP) {
         LOG_WRN("Insufficient heap %s for %s TLS session", fmtSize(ESP.getFreeHeap()), host);
@@ -709,20 +834,10 @@ static void showLocalTime(const char* timeSrc) {
   LOG_INF("Got current time from %s: %s with tz: %s", timeSrc, timeFormat, timezone);
 }
 
-static bool waitForNTPsync(int maxRetries, uint32_t perTryTimeoutMs) {
+static void timeSyncCallback(struct timeval *tv) {
   // wait for local time to sync with NTP server
-  if (!timeSynchronized) {
-    struct tm timeinfo;
-    int retry = 0;
-    while (!getLocalTime(&timeinfo, perTryTimeoutMs) && retry < maxRetries) retry++;
-    if (retry >= maxRetries) {
-      LOG_WRN("Time sync with NTP failed, retry");
-      return false;
-    }
-    LOG_INF("Time synced with NTP: %s, using timezone: %s", ntpServer, timezone);
-    timeSynchronized = true;
-  }
-  return true;
+  LOG_INF("Time synced with NTP: %s, using timezone: %s", ntpServer, timezone);
+  timeSynchronized = true;
 }
 
 void syncToBrowser(uint32_t browserUTC) {
@@ -853,7 +968,6 @@ static void statusCheckTask(void* parameter) {
     // regular status checks
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     if (!dataFilesChecked) checkDataFiles();
-    if (!timeSynchronized) waitForNTPsync();
     if (appSetupDone) doAppPing(timeSynchronized);
     checkScheduledRestart();
 #if INCLUDE_MQTT
@@ -920,25 +1034,47 @@ bool urlEncode(const char* inVal, char* encoded, size_t maxSize) {
 }
 
 void urlDecode(char* inVal) {
+  // Optimized: Precomputed constant-time lookup table (LUT) to eliminate generic bitwise
+  // and arithmetic operations in the hot loop, reducing CPU overhead during hex decoding.
+  static const uint8_t hexDecodeLUT[256] = {
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0,
+      0, 10, 11, 12, 13, 14, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 10, 11, 12, 13, 14, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  };
+
   // replace url encoded characters in-place
-  // decoded output is always equal or shorter than input
-  char* src = inVal;
-  char* dst = inVal;
-  while (*src) {
-    if (*src == '%' && isxdigit((unsigned char)*(src+1)) && isxdigit((unsigned char)*(src+2))) {
-      // decode %XX hex sequence
-      char hex[3] = {*(src+1), *(src+2), 0};
-      *dst++ = (char)strtoul(hex, nullptr, 16);
-      src += 3;
-    } else if (*src == '+') {
+  char* readPtr = inVal;
+  char* writePtr = inVal;
+  while (*readPtr) {
+    if (*readPtr == '%' && isxdigit((unsigned char)readPtr[1]) && isxdigit((unsigned char)readPtr[2])) {
+      char h1 = readPtr[1];
+      char h2 = readPtr[2];
+      int v1 = hexDecodeLUT[(unsigned char)h1];
+      int v2 = hexDecodeLUT[(unsigned char)h2];
+      *writePtr++ = (char)((v1 << 4) | v2);
+      readPtr += 3;
+    } else if (*readPtr == '+') {
       // + is encoded space in form data
-      *dst++ = ' ';
-      src++;
+      *writePtr++ = ' ';
+      readPtr++;
     } else {
-      *dst++ = *src++;
+      *writePtr++ = *readPtr++;
     }
   }
-  *dst = 0; // NUL terminate
+  *writePtr = 0;
 }
 
 void listBuff (const uint8_t* b, size_t len) {
@@ -994,13 +1130,15 @@ void replaceChar(char* s, char c, char r) {
 
 char* fmtSize (uint64_t sizeVal) {
   // format size according to magnitude
-  // only one call per format string
-  static char returnStr[20];
-  if (sizeVal < 50 * 1024) sprintf(returnStr, "%llu bytes", sizeVal);
-  else if (sizeVal < ONEMEG) sprintf(returnStr, "%lluKB", sizeVal / 1024);
-  else if (sizeVal < ONEMEG * 1024) sprintf(returnStr, "%0.1fMB", (double)(sizeVal) / ONEMEG);
-  else sprintf(returnStr, "%0.1fGB", (double)(sizeVal) / (ONEMEG * 1024));
-  return returnStr;
+   // rotating buffer pool to support up to 4 calls per format string
+  static char returnStr[4][24];
+  static uint8_t idx = 0;
+  char* buf = returnStr[idx++ & 3];
+  if (sizeVal < 50 * 1024) snprintf(buf, sizeof(returnStr[0]), "%llu bytes", (unsigned long long)sizeVal);
+  else if (sizeVal < ONEMEG) snprintf(buf, sizeof(returnStr[0]), "%lluKB", (unsigned long long)(sizeVal / 1024));
+  else if (sizeVal < ONEMEG * 1024) snprintf(buf, sizeof(returnStr[0]), "%0.1fMB", (double)(sizeVal) / ONEMEG);
+  else snprintf(buf, sizeof(returnStr[0]), "%0.1fGB", (double)(sizeVal) / (ONEMEG * 1024));
+  return buf;
 }
 
 char* trim(char* str) {
@@ -1048,7 +1186,7 @@ void setupADC() {
 float smoothSensor(float latestVal, float smoothedVal, float alpha) {
   // simple Exponential Moving Average filter 
   // where alpha between 0.0 (max smooth) and 1.0 (no smooth)
-  return (latestVal * alpha) + smoothedVal * (1.0 - alpha);
+  return (latestVal * alpha) + smoothedVal * (1.0f - alpha);
 }
 
 // onboard chip temperature sensor
@@ -1075,7 +1213,7 @@ float readInternalTemp() {
   float intTemp = NULL_TEMP;
 #if CONFIG_IDF_TARGET_ESP32
   // convert on chip raw temperature in F to Celsius degrees
-  intTemp = (temprature_sens_read() - 32) / 1.8;  // value of 55 means not present
+  intTemp = (temprature_sens_read() - 32) / 1.8f;  // value of 55 means not present
 #elif CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3
     temperature_sensor_get_celsius(temp_sensor, &intTemp); 
 #endif
@@ -1110,8 +1248,12 @@ const char* encode64(const char* inp) {
     LOG_WRN("Input string too long: %u chars", len);
     len = 90;
   }
-  for (int i = 0; i < len; i += 3) 
-    strncat(encoded, (char*)encode64chunk((uint8_t*)inp + i, min(len - i, 3)), 4);
+  int outLen = 0;
+  for (int i = 0; i < len; i += 3) {
+    memcpy(encoded + outLen, encode64chunk((uint8_t*)inp + i, min(len - i, 3)), 4);
+    outLen += 4;
+  }
+  encoded[outLen] = 0;  
   return encoded;
 }
 
@@ -1197,14 +1339,13 @@ bool utilsStartup() {
   STACK_MEM = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 #endif
   logSetup();
-  configTzTime(timezone, ntpServer);
 #ifdef NEED_PSRAM
   if (psramFound()) {
     if (ESP.getPsramSize() < MIN_PSRAM * ONEMEG) 
       snprintf(startupFailure, SF_LEN, STARTUP_FAIL "App needs at least %dMB PSRAM", MIN_PSRAM);
   } else snprintf(startupFailure, SF_LEN, STARTUP_FAIL "Need PSRAM to be enabled");
 #endif
-  
+
   prepInternalTemp();
   if (jsonBuff == NULL) jsonBuff = psramFound() ? (char*)ps_malloc(JSON_BUFF_LEN) : (char*)malloc(JSON_BUFF_LEN);
   LOG_INF("Compiled with arduino-esp32 v%s", ESP_ARDUINO_VERSION_STR);
@@ -1212,6 +1353,8 @@ bool utilsStartup() {
   res = startStorage();
   // Load saved user configuration
   if (res) res = loadConfig();
+  sntp_set_time_sync_notification_cb(timeSyncCallback);
+  configTzTime(timezone, ntpServer);
 #ifdef DEV_ONLY
   devSetup();
 #endif

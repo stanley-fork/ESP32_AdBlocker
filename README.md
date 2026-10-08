@@ -2,7 +2,9 @@
 
 ESP32_AdBlocker acts as a DNS Sinkhole (like [Pi-Hole](https://pi-hole.net/)) by returning 0.0.0.0 for any domain names in its blocklist, else uses an external DNS server to resolve IP addresses. This prevents content being retrieved from or sent to blocked domains. A web server is provided to control the service and monitor its operation.
 
-Version 3.5 includes enhancements to DNS query handling and [LED status](#led-status) by user [@dateno1](https://github.com/dateno1)
+Version 3.6 includes
+* enhancements to DNS query handling and [LED status](#led-status) by user [@dateno1](https://github.com/dateno1)
+* timezone fix
 
 ## Requirements
 
