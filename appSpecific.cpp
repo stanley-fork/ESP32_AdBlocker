@@ -948,6 +948,7 @@ ethInt~-1~3~N~Ethernet Interrupt pin
 ethRst~-1~3~N~Ethernet Reset pin
 ethSclk~-1~3~N~Ethernet SPI clock pin
 ethMiso~-1~3~N~Ethernet SPI MISO pin
+ethMosi~-1~3~N~Ethernet SPI MOSI pin
 xLedPin~0~1~N~Led status pin (0 off)
 xLedPull~1~1~C~Led Led active on Lo or Hi
 xLedSimple~1~1~C~WS2812 or Simple Led
