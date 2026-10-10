@@ -35,7 +35,7 @@
 #define HTTP_CLIENTS 2 // http, ws
 #define MAX_STREAMS 0
 #define INDEX_PAGE_PATH DATA_DIR "/AdBlocker" HTML_EXT
-#define FILE_NAME_LEN 64
+#define FILE_NAME_LEN 96 // please readjust this accordingly to compensate for the header data, for now i set to 96
 #define IN_FILE_NAME_LEN 128
 #define JSON_BUFF_LEN (1024 * 4) // set big enough to hold json string
 #define MAX_CONFIGS 70 // > number of entries in configs.txt
