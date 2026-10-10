@@ -488,10 +488,13 @@ struct SnapHdr {
 /* Persist the used portion of the arena, compressed. Called after every
  * successful download; LittleFS wear-leveling makes 1 write/day trivial. */
 static void saveSnapshot() {
-  if (itemsLoaded < 3 || blocklistSize < 4096) { LOG_WRN("Snap skip: tiny"); return; }
+  if (itemsLoaded < 3 || blocklistSize < 4096) { 
+    LOG_WRN("Snap skip: tiny"); 
+    return; 
+  }
 
-  // LittleFS space check (worst-case encoding: every entry unmatched)
-  uint32_t worstCase = blocklistSize + itemsLoaded * 2 + sizeof(SnapHdr) + 4096;
+  // LittleFS space check (worst-case encoding: every entry unmatched + trailing CRC)
+  uint32_t worstCase = blocklistSize + itemsLoaded * 2 + sizeof(SnapHdr) + sizeof(uint32_t) + 4096;
   uint32_t freeFs = STORAGE.totalBytes() - STORAGE.usedBytes();
   if (freeFs < worstCase) {
     LOG_WRN("Snap skipped: flash free %uKB < needed ~%uKB",
@@ -503,17 +506,32 @@ static void saveSnapshot() {
   uint32_t nameBytes  = 0;
   uint32_t matchBytes = 0;
 
-  SnapHdr h; memset(&h, 0, sizeof(h));
-  h.magic = SNAP_MAGIC; h.ver = SNAP_VER;
-  h.items = itemsLoaded; h.blsize = blocklistSize;
-  h.blockCnt = blockCnt; h.allowCnt = allowCnt; h.duplicates = duplicates;
+  SnapHdr h; 
+  memset(&h, 0, sizeof(h));
+  h.magic = SNAP_MAGIC; 
+  h.ver = SNAP_VER;
+  h.items = itemsLoaded; 
+  h.blsize = blocklistSize;
+  h.blockCnt = blockCnt; 
+  h.allowCnt = allowCnt; 
+  h.duplicates = duplicates;
 
   char tmpPath[80];
   snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", SNAP_PATH);
 
   File f = STORAGE.open(tmpPath, FILE_WRITE);
-  if (!f) { LOG_ERR("Snap OPEN FAILED: %s", tmpPath); return; }
-  f.write((uint8_t*)&h, sizeof(h));              // placeholder header, finalized below
+  if (!f) { 
+    LOG_ERR("Snap OPEN FAILED: %s", tmpPath); 
+    return; 
+  }
+  
+  // Write the initial header to the file
+  if (f.write((uint8_t*)&h, sizeof(h)) != sizeof(h)) {
+    LOG_ERR("Snap: header write failed");
+    f.close();
+    STORAGE.remove(tmpPath);
+    return;
+  }
 
   uint32_t crc      = crc32_begin();
   uint32_t encBytes = 0;
@@ -522,7 +540,24 @@ static void saveSnapshot() {
   bool ok = true;
   uint32_t t0 = millis();
 
+  // Buffered writing optimization for ESP32 flash architecture
+  uint8_t buf[512];
+  size_t bufIdx = 0;
+
+  auto flushBuffer = [&]() -> bool {
+    if (bufIdx > 0) {
+      if (f.write(buf, bufIdx) != bufIdx) return false;
+      bufIdx = 0;
+    }
+    return true;
+  };
+
   for (uint32_t i = 0; i < itemsLoaded && ok; i++) {
+    // Avoid TWDT reset triggers on huge blocklists
+    if ((i & 0x7FF) == 0) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
     const char* cur    = storage + ptrs[i];
     size_t      maxCur = blocklistSize - ptrs[i];
     size_t      cl     = strnlen(cur, maxCur);     // BOUNDED strlen
@@ -539,58 +574,89 @@ static void saveSnapshot() {
     }
 
     size_t ml = 0;
-    while (ml < cl && ml < prevLen && ml < 255 && cur[ml] == prev[ml]) ml++;
+    while (ml < cl && ml < prevLen && ml < 255 && cur[ml] == prev[ml]) {
+      ml++;
+    }
     size_t sl = cl - ml;
-    if (sl > 255) { ml -= (sl - 255); sl = 255; }
+    if (sl > 255) { 
+      ml -= (sl - 255); 
+      sl = 255; 
+    }
 
     uint8_t lens[2] = { (uint8_t)ml, (uint8_t)sl };
     crc = crc32_upd(crc, lens, 2);
-    crc = crc32_upd(crc, (const uint8_t*)cur + ml, sl);
-    ok = f.write(lens, 2) == 2 &&
-         (sl == 0 || f.write((const uint8_t*)cur + ml, sl) == sl);
-    encBytes   += 2 + sl;
+    encBytes += 2;
+
+    // Buffer management for lengths
+    if (bufIdx + 2 > sizeof(buf)) {
+      if (!flushBuffer()) { ok = false; break; }
+    }
+    buf[bufIdx++] = lens[0];
+    buf[bufIdx++] = lens[1];
+
+    // Buffer management for suffix strings
+    if (sl > 0) {
+      crc = crc32_upd(crc, (const uint8_t*)(cur + ml), sl);
+      encBytes += sl;
+
+      size_t remainingSl = sl;
+      size_t srcOffset = 0;
+      while (remainingSl > 0) {
+        if (bufIdx >= sizeof(buf)) {
+          if (!flushBuffer()) { ok = false; break; }
+        }
+        size_t chunk = sizeof(buf) - bufIdx;
+        if (chunk > remainingSl) chunk = remainingSl;
+
+        memcpy(buf + bufIdx, cur + ml + srcOffset, chunk);
+        bufIdx += chunk;
+        srcOffset += chunk;
+        remainingSl -= chunk;
+      }
+      if (!ok) break;
+    }
+
     nameBytes  += cl;
     matchBytes += ml;
-    prev = cur; prevLen = cl;
+    prev = cur;
+    prevLen = cl;
   }
 
-  // corruption tripwire: encoded stream can never exceed names + 2B/entry
-  if (encBytes > nameBytes + itemsLoaded * 2 + 16) {
-    f.close();
-    STORAGE.remove(tmpPath);
-    LOG_ERR("Snap ABORTED: encoder wrote %luKB for %luKB of names "
-            "(entries=%u matched=%luKB) - memory corruption suspected",
-            (unsigned long)(encBytes / 1024), (unsigned long)(nameBytes / 1024),
-            (unsigned)itemsLoaded, (unsigned long)(matchBytes / 1024));
-    return;                                        // flash untouched
-  }
+  // Flush remaining encoded data bytes
+  if (ok && !flushBuffer()) ok = false;
 
+  // Finalize serialization by appending trailing CRC32
   if (ok) {
-    h.rawLen = encBytes;
-    h.crc    = crc32_end(crc);
-    f.seek(0);
-    f.write((uint8_t*)&h, sizeof(h));              // finalize header
+    uint32_t finalCrc = crc32_end(crc);
+    if (f.write((uint8_t*)&finalCrc, sizeof(finalCrc)) != sizeof(finalCrc)) {
+      ok = false;
+    } else {
+      encBytes += sizeof(finalCrc);
+    }
   }
+
   f.close();
 
   if (!ok) {
+    LOG_ERR("Snap WRITE FAILED or corrupted. Cleaning up temporary files.");
     STORAGE.remove(tmpPath);
-    LOG_WRN("Snapshot encode failed - removed");
     return;
   }
 
-  STORAGE.remove(SNAP_PATH);                       // drop previous generation
+  STORAGE.remove(SNAP_PATH);
   if (!STORAGE.rename(tmpPath, SNAP_PATH)) {
-    LOG_ERR("Snap rename %s -> %s failed", tmpPath, SNAP_PATH);
+    LOG_ERR("Snap RENAME FAILED from %s to %s", tmpPath, SNAP_PATH);
     STORAGE.remove(tmpPath);
     return;
   }
 
-    LOG_INF("Snapshot saved: %u domains, %luKB -> %luKB (%lu s) "
-          "[names %luKB, prefix-matched %luKB]",
-          (unsigned)(itemsLoaded - 2), (unsigned long)(blocklistSize / 1024),
-          (unsigned long)(encBytes / 1024), (unsigned long)((millis() - t0) / 1000),
-          (unsigned long)(nameBytes / 1024), (unsigned long)(matchBytes / 1024));
+  uint32_t t1 = millis();
+  LOG_INF("Snap SAVED: %u items, %uKB raw -> %uKB enc (%u%%) in %ums",
+          (unsigned)itemsLoaded,
+          (unsigned)(blocklistSize / 1024),
+          (unsigned)((encBytes + sizeof(h)) / 1024),
+          (unsigned)((encBytes + sizeof(h)) * 100 / (blocklistSize ? blocklistSize : 1)),
+          (unsigned)(t1 - t0));
 }
 
 /* Restore arena from snapshot. No WiFi / no valid clock required.
@@ -598,20 +664,33 @@ static void saveSnapshot() {
  * entries, then verified against the stored item count. */
 static bool loadSnapshot() {
   File f = STORAGE.open(SNAP_PATH, FILE_READ);
-  if (!f) { LOG_INF("No snapshot yet (%s)", SNAP_PATH); return false; }
+  if (!f) { 
+    LOG_INF("No snapshot yet (%s)", SNAP_PATH); 
+    return false; 
+  }
 
   SnapHdr h;
-  if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h))
+  if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h)) {
+    f.close();
     SNAP_FAIL("header read");
-  if (h.magic != SNAP_MAGIC)
+  }
+  if (h.magic != SNAP_MAGIC) {
+    f.close();
     SNAP_FAIL("bad magic");
-  if (h.ver   != SNAP_VER)
+  }
+  if (h.ver   != SNAP_VER) {
+    f.close();
     SNAP_FAIL("version %u", h.ver);
-  if (h.items < 2 || h.items > maxDomains)
-    SNAP_FAIL("item count %lu", h.items);
-  if (h.blsize == 0 || h.blsize > storageSize)
+  }
+  if (h.items < 2 || h.items > maxDomains) {
+    f.close();
+    SNAP_FAIL("item count %lu", (unsigned long)h.items);
+  }
+  if (h.blsize == 0 || h.blsize > storageSize) {
+    f.close();
     SNAP_FAIL("arena %luKB exceeds storage %luKB",
               (unsigned long)(h.blsize / 1024), (unsigned long)(storageSize / 1024));
+  }
 
   memset(ptrs, 0, (maxDomains + 2) * sizeof(uint32_t));
   uint32_t crc = crc32_begin();
@@ -619,10 +698,44 @@ static bool loadSnapshot() {
   uint32_t prevPtr = 0;
   bool havePrev = false, ok = true;
 
+  // Stream reader buffer to maximize SPI Flash throughput on ESP32-S3
+  uint8_t buf[512];
+  size_t bufIdx = 0;
+  size_t bufLen = 0;
+
+  auto fillBuffer = [&]() -> bool {
+    if (bufIdx >= bufLen) {
+      int readBytes = f.read(buf, sizeof(buf));
+      if (readBytes <= 0) return false;
+      bufLen = readBytes;
+      bufIdx = 0;
+    }
+    return true;
+  };
+
+  auto readBufferedBytes = [&](uint8_t* dest, size_t count) -> bool {
+    size_t copied = 0;
+    while (copied < count) {
+      if (!fillBuffer()) return false;
+      size_t chunk = bufLen - bufIdx;
+      if (chunk > (count - copied)) chunk = count - copied;
+      memcpy(dest + copied, buf + bufIdx, chunk);
+      bufIdx += chunk;
+      copied += chunk;
+    }
+    return true;
+  };
+
   while (idx < h.items && ok) {
+    // Keep Watchdog active during execution bursts
+    if ((idx & 0x7FF) == 0) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
     uint8_t lens[2];
-    if (f.read(lens, 2) != 2) { ok = false; break; }
-    crc = crc32_upd(crc, lens, 2); enc += 2;
+    if (!readBufferedBytes(lens, 2)) { ok = false; break; }
+    crc = crc32_upd(crc, lens, 2); 
+    enc += 2;
     size_t ml = lens[0], sl = lens[1];
 
     ptrs[idx] = pos;
@@ -632,29 +745,44 @@ static bool loadSnapshot() {
     }
     if (sl) {
       if (pos + ml + sl + 1 > storageSize) { ok = false; break; }
-      if (f.read((uint8_t*)storage + pos + ml, sl) != sl) { ok = false; break; }
+      if (!readBufferedBytes((uint8_t*)storage + pos + ml, sl)) { ok = false; break; }
       crc = crc32_upd(crc, (const uint8_t*)storage + pos + ml, sl);
     }
     storage[pos + ml + sl] = 0;
     enc += sl;
-    prevPtr = pos; havePrev = true;
+    prevPtr = pos; 
+    havePrev = true;
     pos += ml + sl + 1;
     idx++;
   }
-  crc = crc32_end(crc);
+  
+  uint32_t computedCrc = crc32_end(crc);
+  uint32_t fileCrc = 0;
+  
+  // Extract trailing 4-byte checksum using the active optimization buffer stream
+  if (ok) {
+    if (!readBufferedBytes((uint8_t*)&fileCrc, sizeof(fileCrc))) {
+      ok = false;
+    }
+  }
   f.close();
 
-  if (!ok || idx != h.items || pos != h.blsize || crc != h.crc) {
+  if (!ok || idx != h.items || pos != h.blsize || computedCrc != fileCrc) {
     LOG_WRN("Snapshot invalid (%s)",
-            crc != h.crc ? "CRC" : idx != h.items ? "count" : "bounds");
+            computedCrc != fileCrc ? "CRC" : idx != h.items ? "count" : "bounds");
     return false;
   }
+  
   ptrs[idx] = pos;                              // trailing sentinel
-  blocklistSize = h.blsize;  itemsLoaded = h.items;
-  blockCnt = h.blockCnt;     allowCnt = h.allowCnt; duplicates = h.duplicates;
+  blocklistSize = h.blsize;  
+  itemsLoaded = h.items;
+  blockCnt = h.blockCnt;     
+  allowCnt = h.allowCnt; 
+  duplicates = h.duplicates;
   lastLoadMs = millis();
   startupFailure[0] = 0;
-  LOG_ALT("Restored %lu domains (%s) from snapshot", itemsLoaded - 2, fmtSize(blocklistSize));
+  
+  LOG_ALT("Restored %lu domains (%s) from snapshot", (unsigned long)(itemsLoaded - 2), fmtSize(blocklistSize));
   return true;
 }
 
@@ -948,6 +1076,7 @@ ethInt~-1~3~N~Ethernet Interrupt pin
 ethRst~-1~3~N~Ethernet Reset pin
 ethSclk~-1~3~N~Ethernet SPI clock pin
 ethMiso~-1~3~N~Ethernet SPI MISO pin
+ethMosi~-1~3~N~Ethernet SPI MOSI pin
 xLedPin~0~1~N~Led status pin (0 off)
 xLedPull~1~1~C~Led Led active on Lo or Hi
 xLedSimple~1~1~C~WS2812 or Simple Led
