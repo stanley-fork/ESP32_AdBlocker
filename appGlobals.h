@@ -30,12 +30,12 @@
 #define MIN_PSRAM 4
 
 #define APP_NAME "ESP32_AdBlocker" // max 15 chars
-#define APP_VER "3.5"
+#define APP_VER "3.7"
 
 #define HTTP_CLIENTS 2 // http, ws
 #define MAX_STREAMS 0
 #define INDEX_PAGE_PATH DATA_DIR "/AdBlocker" HTML_EXT
-#define FILE_NAME_LEN 96 // please readjust this accordingly to compensate for the header data, for now i set to 96
+#define FILE_NAME_LEN 96
 #define IN_FILE_NAME_LEN 128
 #define JSON_BUFF_LEN (1024 * 4) // set big enough to hold json string
 #define MAX_CONFIGS 70 // > number of entries in configs.txt
@@ -60,7 +60,7 @@
 #define INCLUDE_WEBDAV true   // webDav.cpp (WebDAV protocol)
 
 // to determine if newer data files need to be loaded
-#define CFG_VER 7
+#define CFG_VER 8
 
 #ifdef CONFIG_IDF_TARGET_ESP32S3 
 #define SERVER_STACK_SIZE (1024 * 8)

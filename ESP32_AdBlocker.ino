@@ -18,8 +18,8 @@
 #include "appGlobals.h"
 
 void setup() { 
-  utilsStartup();
-  if (startNetwork()) {
+  bool res = utilsStartup();
+  if (res && startNetwork()) {
     // start rest of services
     appSetup();
     checkMemory();
